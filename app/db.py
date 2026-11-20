@@ -57,6 +57,17 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at   TEXT NOT NULL,
     PRIMARY KEY (round_id, batch_no)
 );
+
+-- 按票号查现行样本/备选（冲红退出、未知票号判定）与按专题取名单用；
+-- 上千专题的长链里没有这些索引会退化为逐票全表扫描，整批处理从秒级劣化到分钟级。
+CREATE INDEX IF NOT EXISTS idx_samples_invoice
+    ON samples(round_id, invoice_no, active);
+CREATE INDEX IF NOT EXISTS idx_samples_topic
+    ON samples(round_id, topic_code, active, position);
+CREATE INDEX IF NOT EXISTS idx_candidates_invoice
+    ON candidates(round_id, invoice_no, available);
+CREATE INDEX IF NOT EXISTS idx_candidates_topic
+    ON candidates(round_id, topic_code, available, position);
 """
 
 

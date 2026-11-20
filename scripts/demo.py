@@ -71,7 +71,40 @@ def main():
                       json={"batch_no": "P1", "invoice_nos": ["A2"]})
     show(f"6. 同轮同批号换一组票号 -> HTTP {conflict.status_code}", conflict.json())
 
-    print("\n试跑完成：以上 5、6 的断言均已通过。")
+    # 7. 长链：上千专题逐级换位，另加一个无备选专题制造缺额
+    n = 1200
+    chain_rid = f"{RID}-LONG"
+    chain = [
+        {"topic_code": f"T{i}", "quota": 1, "samples": [f"X{i}"],
+         "candidates": ([f"C{i}", f"C{i + 1}", f"E{i}"] if i < n else ["C1", f"E{i}"])}
+        for i in range(1, n + 1)
+    ]
+    chain.append({"topic_code": "T-无备选", "quota": 1, "samples": ["Y1"], "candidates": []})
+    assert c.post("/rounds", json={"round_id": chain_rid, "topics": chain}).status_code == 201
+    long_flush = c.post(
+        f"/rounds/{chain_rid}/redflush-batches",
+        json={"batch_no": "L1", "invoice_nos": [f"X{i}" for i in range(1, n + 1)] + ["Y1"]},
+    )
+    assert long_flush.status_code == 201, long_flush.text
+    long_receipt = long_flush.json()
+    short = [t for t in long_receipt["topics"] if t["shortfall"]]
+    print(
+        f"\n=== 7. 长链冲红 L1：{n} 个专题整链换位，HTTP {long_flush.status_code}，"
+        f"补上 {long_receipt['total_filled']} 个名额 ==="
+    )
+    print(f"    剩余缺额：{[(t['topic_code'], t['shortfall']) for t in short]}")
+
+    # 8. 后续批次：冲掉上一批补回的票，再次按当前备选池补样
+    carried = long_receipt["topics"][n // 2]["replacements"][0]
+    follow = c.post(f"/rounds/{chain_rid}/redflush-batches",
+                    json={"batch_no": "L2", "invoice_nos": [carried]})
+    assert follow.status_code == 201, follow.text
+    filled = [(t["topic_code"], t["replacements"]) for t in follow.json()["topics"]
+              if t["replacements"]]
+    print(f"=== 8. 后续批次 L2（冲掉 {carried}）：补上 {follow.json()['total_filled']} 个名额 "
+          f"{filled} ===")
+
+    print("\n试跑完成：以上 5、6 的断言、长链补样与后续批次均已通过。")
 
 
 if __name__ == "__main__":

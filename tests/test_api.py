@@ -176,6 +176,33 @@ def test_failed_batch_rolls_back(client, monkeypatch):
     assert state["topics"][0]["candidates"] == ["C1", "C2"]
     assert state["batches_processed"] == 0  # 回执未写入
 
+def test_redflush_writes_are_atomic(client, monkeypatch):
+    """回执写入阶段失败时，已完成的退名单与替补入册一并回滚。"""
+    n = 300
+    assert register(client, topics=_chain_topics(n)).status_code == 201
+    import app.service as service
+
+    real_dumps = service.json.dumps
+
+    def explode(*_a, **_k):
+        raise RuntimeError("模拟回执写入失败")
+
+    monkeypatch.setattr(service.json, "dumps", explode)
+    with pytest.raises(RuntimeError):
+        flush(client, "B1", [f"X{i}" for i in range(1, n + 1)])
+    monkeypatch.setattr(service.json, "dumps", real_dumps)
+
+    state = client.get("/rounds/R1").json()
+    assert state["batches_processed"] == 0
+    assert all(t["shortfall"] == 0 for t in state["topics"])  # 全部仍为原样本
+    assert all(len(t["samples"]) == 1 and t["samples"][0] == f"X{i + 1}"
+               for i, t in enumerate(state["topics"]))
+
+    # 回滚后可重新提交同一批号，且正常生效
+    retry = flush(client, "B1", [f"X{i}" for i in range(1, n + 1)])
+    assert retry.status_code == 201 and retry.json()["total_filled"] == n
+
+
 def test_redflush_idempotent_replay(client):
     register(client, topics=[
         {"topic_code": "T1", "quota": 2, "samples": ["A1", "A2"], "candidates": ["C1", "C2"]}
@@ -194,6 +221,162 @@ def test_redflush_conflict_on_different_set(client):
     conflict = flush(client, "B1", ["A2"])  # 同轮同批号换一组票号
     assert conflict.status_code == 409
     assert client.get("/rounds/R1").json()["batches_processed"] == 1
+
+
+# ---------------------------------------------------------------- 长链补样
+
+def _chain_topics(n, spare=False):
+    """一条真正贯穿全链的备选链：Ti 备选 [Ci, C(i+1)]，最后一个专题只挂 C1。
+
+    补样时 T1..T(n-1) 会按登记顺序先占 C2..Cn，最后 Tn 只能抢 C1，
+    必须沿整条链逐级换位才能补满——链长上千时旧递归实现会栈溢出报 500。
+    spare=True 时每个专题再挂一张独占的 E(i)，供后续批次冲红后有票可补。
+    """
+    topics = []
+    for i in range(1, n):
+        cands = [f"C{i}", f"C{i + 1}"] + ([f"E{i}"] if spare else [])
+        topics.append(
+            {"topic_code": f"T{i}", "quota": 1, "samples": [f"X{i}"], "candidates": cands}
+        )
+    last = ["C1"] + ([f"E{n}"] if spare else [])
+    topics.append({"topic_code": f"T{n}", "quota": 1, "samples": [f"X{n}"], "candidates": last})
+    return topics
+
+
+def test_long_chain_backfills_all_slots(client):
+    """上千专题逐级换位仍能整批补满，不报 500，每张票只占一个名额。"""
+    n = 1500
+    assert register(client, topics=_chain_topics(n)).status_code == 201
+    r = flush(client, "B1", [f"X{i}" for i in range(1, n + 1)])
+    assert r.status_code == 201, r.text
+    receipt = r.json()
+    assert receipt["total_filled"] == n
+    assert all(t["replacements"] and t["shortfall"] == 0 for t in receipt["topics"])
+    # 最后一个专题抢到 C1，链上每个专题依次上移一张
+    assert receipt["topics"][-1]["replacements"] == ["C1"]
+    assert receipt["topics"][0]["replacements"] == ["C2"]
+
+    state = client.get("/rounds/R1").json()["topics"]
+    assert all(t["shortfall"] == 0 for t in state)
+    seen = [inv for t in state for inv in t["samples"]]
+    assert len(seen) == len(set(seen)) == n  # 每张票只占一个名额
+
+
+def test_long_chain_shortfall_applies_and_is_reported(client):
+    """备选不足时本批照样生效：能补的补满，回执逐专题列出剩余缺额。"""
+    n = 1500
+    topics = _chain_topics(n) + [
+        {"topic_code": "T-NO-CAND", "quota": 1, "samples": ["Y1"], "candidates": []}
+    ]
+    assert register(client, topics=topics).status_code == 201
+    r = flush(client, "B1", [f"X{i}" for i in range(1, n + 1)] + ["Y1"])
+    assert r.status_code == 201, r.text
+    receipt = r.json()
+    assert receipt["total_filled"] == n  # 长链全部补满
+    assert [t["topic_code"] for t in receipt["topics"]][-1] == "T-NO-CAND"
+    assert receipt["topics"][-1]["vacancy_before"] == 1
+
+    short = [t for t in receipt["topics"] if t["shortfall"]]
+    assert len(short) == 1 and short[0]["replacements"] == []
+    assert short[0]["topic_code"] == "T-NO-CAND"
+    assert short[0]["vacancy_before"] == 1 and short[0]["shortfall"] == 1
+
+    state = client.get("/rounds/R1").json()
+    assert state["batches_processed"] == 1  # 本批已生效
+    assert [(t["topic_code"], t["shortfall"]) for t in state["topics"] if t["shortfall"]] == [
+        (short[0]["topic_code"], 1)
+    ]
+
+
+def _recursive_allocate(topic_order, vacancies, candidates):
+    """旧版递归 Kuhn 的参考实现：同样输入须得到逐专题相同的替补票号与顺序。"""
+    import sys
+
+    owner = {}
+
+    def augment(topic, seen):
+        for inv in candidates.get(topic, ()):
+            if inv in seen:
+                continue
+            seen.add(inv)
+            prev = owner.get(inv)
+            if prev is None or augment(prev, seen):
+                owner[inv] = topic
+                return True
+        return False
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(limit, 20000))
+    try:
+        for topic in topic_order:
+            for _ in range(max(0, vacancies.get(topic, 0))):
+                if not augment(topic, set()):
+                    break
+    finally:
+        sys.setrecursionlimit(limit)
+    return {
+        t: [i for i in candidates.get(t, ()) if owner.get(i) == t]
+        for t in topic_order
+    }
+
+
+def _expected_assignments(state, flushed):
+    """按旧版递归算法推算本批补样结果（票号与顺序）。"""
+    inflight = set(flushed)
+    order = [t["topic_code"] for t in state["topics"]]
+    vacancies = {
+        t["topic_code"]: t["quota"] - len([s for s in t["samples"] if s not in inflight])
+        for t in state["topics"]
+    }
+    candidates = {
+        t["topic_code"]: [c for c in t["candidates"] if c not in inflight]
+        for t in state["topics"]
+    }
+    return _recursive_allocate(order, vacancies, candidates)
+
+
+def test_long_chain_followup_batches_match_old_version(client):
+    """连续多批：每批的逐专题替补票号与顺序须与旧版递归算法一致。
+
+    本批用掉哪些备选会影响下一批，因此必须逐批在当前名单上比对；
+    长链上累计换位后仍要保持同样的选择。
+    """
+    n = 1200
+    assert register(client, topics=_chain_topics(n, spare=True)).status_code == 201
+    first = flush(client, "B1", [f"X{i}" for i in range(1, n + 1)]).json()
+    # B1 整链换位：Ti 拿 C(i+1)，Tn 抢 C1
+    assert first["total_filled"] == n and first["topics"][-1]["replacements"] == ["C1"]
+
+    applied = ["B1"]
+    # 后续每批冲掉前一批补回的票 + 另一个专题当前持有的票，验证“上一批用掉
+    # 哪些备选影响下一批可用池”，且每批都仍能补上。
+    carried = None
+    for k, topic in enumerate(["T600", "T700", "T800", "T900"], start=2):
+        state = client.get("/rounds/R1").json()
+        held = {t["topic_code"]: t["samples"] for t in state["topics"]}
+        invoices = [held[topic][0]] + ([carried] if carried else [])
+        expected = _expected_assignments(state, invoices)
+        assert sum(len(v) for v in expected.values()) >= 1, f"B{k} 应确实补上票"
+        resp = flush(client, f"B{k}", invoices)
+        assert resp.status_code == 201, resp.text
+        receipt = resp.json()
+        assert [t["topic_code"] for t in receipt["topics"]] == list(expected)
+        assert receipt["total_filled"] == sum(len(v) for v in expected.values())
+        for t in receipt["topics"]:
+            assert t["replacements"] == expected[t["topic_code"]], f"B{k}"
+            assert t["shortfall"] == t["vacancy_before"] - len(expected[t["topic_code"]])
+        carried = next(
+            (t["replacements"][0] for t in receipt["topics"] if t["replacements"]), None
+        )
+
+        applied.append(f"B{k}")
+        after = client.get("/rounds/R1").json()
+        assert after["batches_processed"] == len(applied)
+        for t_after, t_receipt in zip(after["topics"], receipt["topics"]):
+            got = [i for i in t_after["samples"] if i in t_receipt["replacements"]]
+            assert got == t_receipt["replacements"]
+            assert t_after["shortfall"] == t_receipt["shortfall"]
+            assert all(i not in t_after["samples"] for i in invoices)
 
 
 # ---------------------------------------------------------------- 查询与持久化
